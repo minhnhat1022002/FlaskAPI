@@ -171,14 +171,20 @@ class Data(object):
         return convert(d.hour)
 
     def get_norm_adj_mat(self):
-        def normalized_sym(adj):
-            rowsum: ndarray = np.array(adj.sum(1))
-            d_inv = np.power(rowsum, -0.5).flatten()
-            d_inv[np.isinf(d_inv)] = 0.
-            d_mat_inv = sp.diags(d_inv)
+        def normalized_sym(adj): # Ma tran D nam o day
+            """
+            Â = D^(-1/2)*A*D^(-1/2)
+            adj: matrix A
+            d_mat_inv: matrix D
+            norm_adj: Â
+            """
+            rowsum: ndarray = np.array(adj.sum(1)) # Dem so tuong tac tung user (the hien bac cua mot dinh)
+            d_inv = np.power(rowsum, -0.5).flatten()  # lam phang ma tran thu duoc lan luot bac cua tung dinh
+            d_inv[np.isinf(d_inv)] = 0. # xoa di phan tu co gia tri inf
+            d_mat_inv = sp.diags(d_inv) # tao ma tran duong cheo chua so bac cua moi dinh
 
-            norm_adj = d_mat_inv.dot(adj)
-            norm_adj = norm_adj.dot(d_mat_inv)
+            norm_adj = d_mat_inv.dot(adj) #Â = D^(-1/2)*A
+            norm_adj = norm_adj.dot(d_mat_inv)# Â = Â*D^(-1/2)
             return norm_adj.tocsr()
 
         try:
@@ -469,8 +475,8 @@ class Data(object):
             users = [rd.choice(self.exist_users) for _ in range(self.batch_size)]
 
         def sample_pos_items_for_u(u, num):
-            pos_items = self.train_items[u]
-            n_pos_items = len(pos_items)
+            pos_items = self.train_items[u] # ground truth
+            n_pos_items = len(pos_items) # no item
             pos_batch = []
             while True:
                 if len(pos_batch) == num:

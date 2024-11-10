@@ -10,7 +10,7 @@ def parse_args():
     parser.add_argument('--proj_path', nargs='?', default='',
                         help='Project path.')
 
-    parser.add_argument('--dataset', nargs='?', default='brightkite5',
+    parser.add_argument('--dataset', nargs='?', default='gowalla',
                         help='Choose a dataset from {gowalla, epinions, librarything}')
     parser.add_argument('--pretrain', type=int, default=0,
                         help='0: No pretrain, -1: Pretrain with the learned embeddings, 1:Pretrain with stored models.')

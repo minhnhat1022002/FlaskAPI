@@ -76,8 +76,6 @@ def test(sess, model, users_to_test, drop_flag=False, train_set_flag=0):
     result['map'] += final_result[2]
     result['mrr'] += final_result[4]
     return result
-               
-            
 
 
 
