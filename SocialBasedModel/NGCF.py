@@ -22,15 +22,10 @@ class CombiGCN(object):
         self.pretrain_data = pretrain_data
         self.n_users = data_config['n_users']
         self.n_items = data_config['n_items']
-        self.n_fold = 100
+        self.n_fold = 1
         self.norm_adj = data_config['norm_adj']
         self.social_adj = data_config['social_adj']
         self.similar_users_adj = data_config['similar_users_adj']
-        self.sharing_adj = data_config['sharing_adj']
-        self.location_adj = data_config['location_adj']
-        self.similar_item_adj = data_config['similar_item_adj']
-        self.similar_item_time_adj = data_config['similar_item_time_adj']
-        self.spatio_temporal_adj = data_config['spatio_temporal_adj']
         self.n_nonzero_elems = self.norm_adj.count_nonzero()
         self.lr = args.lr
         self.emb_dim = args.embed_size
@@ -167,6 +162,38 @@ class CombiGCN(object):
                                                         name='item_embedding', dtype=tf.float32)
             print('using pretrained initialization')
 
+        self.weight_size_list = [self.emb_dim] + self.weight_size
+        for k in range(self.n_layers):
+            all_weights['W_1_%d' % k] = tf.Variable(
+                initializer([self.weight_size_list[k], self.weight_size_list[k + 1]]), name='W_1_%d' % k)
+            all_weights['b_1_%d' % k] = tf.Variable(
+                initializer([1, self.weight_size_list[k + 1]]), name='b_1_%d' % k)
+
+            all_weights['W_2_%d' % k] = tf.Variable(
+                initializer([self.weight_size_list[k], self.weight_size_list[k + 1]]), name='W_2_%d' % k)
+            all_weights['b_2_%d' % k] = tf.Variable(
+                initializer([1, self.weight_size_list[k + 1]]), name='b_2_%d' % k)
+
+            all_weights['W_3_%d' % k] = tf.Variable(
+                initializer([self.weight_size_list[k] * 2, self.weight_size_list[k + 1]]), name='W_3_%d' % k)
+            all_weights['b_3_%d' % k] = tf.Variable(
+                initializer([1, self.weight_size_list[k + 1]]), name='b_3_%d' % k)
+
+            all_weights['W_gc_%d' % k] = tf.Variable(
+                initializer([self.weight_size_list[k], self.weight_size_list[k + 1]]), name='W_gc_%d' % k)
+            all_weights['b_gc_%d' % k] = tf.Variable(
+                initializer([1, self.weight_size_list[k + 1]]), name='b_gc_%d' % k)
+
+            all_weights['W_bi_%d' % k] = tf.Variable(
+                initializer([self.weight_size_list[k], self.weight_size_list[k + 1]]), name='W_bi_%d' % k)
+            all_weights['b_bi_%d' % k] = tf.Variable(
+                initializer([1, self.weight_size_list[k + 1]]), name='b_bi_%d' % k)
+
+            all_weights['W_mlp_%d' % k] = tf.Variable(
+                initializer([self.weight_size_list[k] * 2, self.weight_size_list[k + 1]]), name='W_mlp_%d' % k)
+            all_weights['b_mlp_%d' % k] = tf.Variable(
+                initializer([1, self.weight_size_list[k + 1]]), name='b_mlp_%d' % k)
+
         return all_weights
 
     def _split_A_hat(self, X):
@@ -201,26 +228,13 @@ class CombiGCN(object):
 
         return A_fold_hat
 
-    def _split_U_hat(self, X):
+    def _split_SI_hat(self, X):
         SI_fold_hat = []
-        fold_len = self.n_users // self.n_fold
+        fold_len = (self.n_users + self.n_users) // self.n_fold
         for i_fold in range(self.n_fold):
             start = i_fold * fold_len
             if i_fold == self.n_fold - 1:
-                end = self.n_users
-            else:
-                end = (i_fold + 1) * fold_len
-            H = X[start:end]
-            SI_fold_hat.append(self._convert_sp_mat_to_sp_tensor(H))
-        return SI_fold_hat
-
-    def _split_I_hat(self, X):
-        SI_fold_hat = []
-        fold_len = self.n_items // self.n_fold
-        for i_fold in range(self.n_fold):
-            start = i_fold * fold_len
-            if i_fold == self.n_fold - 1:
-                end = self.n_items
+                end = self.n_users + self.n_users
             else:
                 end = (i_fold + 1) * fold_len
             H = X[start:end]
@@ -233,43 +247,35 @@ class CombiGCN(object):
         else:
             A_fold_hat = self._split_A_hat(self.norm_adj)
 
-        SI_fold_hat = self._split_U_hat(self.similar_users_adj)
-
-        users_embed = self.weights['user_embedding']
-        items_embed = self.weights['item_embedding']
-
-        ego_embed = tf.concat([users_embed, items_embed], axis=0)
-        all_embed = [ego_embed]
+        ego_embeddings = tf.concat([self.weights['user_embedding'], self.weights['item_embedding']], axis=0)
+        all_embeddings = [ego_embeddings]
 
         for k in range(0, self.n_layers):
-            users_embed, items_embed = tf.split(ego_embed, [self.n_users, self.n_items], 0)
+            temp_embed = []
+            for f in range(self.n_fold):
+                temp_embed.append(tf.sparse_tensor_dense_matmul(A_fold_hat[f], ego_embeddings))
+            side_embeddings = tf.concat(temp_embed, 0)
+            sum_embeddings = tf.nn.leaky_relu(
+                tf.matmul(side_embeddings, self.weights['W_gc_%d' % k]) + self.weights['b_gc_%d' % k])
 
-            temp_embed_interaction = []
-            for fold in range(self.n_fold):
-                temp_embed_interaction.append(tf.sparse_tensor_dense_matmul(A_fold_hat[fold], ego_embed))
-            all_embed_interaction = tf.concat(temp_embed_interaction, axis=0)
+            # bi messages of neighbors.
+            bi_embeddings = tf.multiply(ego_embeddings, side_embeddings)
+            # transformed bi messages of neighbors.
+            bi_embeddings = tf.nn.leaky_relu(
+                tf.matmul(bi_embeddings, self.weights['W_bi_%d' % k]) + self.weights['b_bi_%d' % k])
+            # non-linear activation.
+            ego_embeddings = sum_embeddings + bi_embeddings
 
-            temp_embed_similar_users = []
-            for fold in range(self.n_fold):
-                temp_embed_similar_users.append(tf.sparse_tensor_dense_matmul(SI_fold_hat[fold], users_embed))
-            users_embed_similar = tf.concat(temp_embed_similar_users, axis=0)
+            # message dropout.
+            # ego_embeddings = tf.nn.dropout(ego_embeddings, 1 - self.mess_dropout[k])
 
-            users_embed_interaction, items_embed_next = tf.split(all_embed_interaction, [self.n_users, self.n_items],
-                                                                 0)
-            fusion_embed_items = [users_embed_interaction, users_embed_similar]
-            fusion_embed_items = tf.stack(fusion_embed_items, 1)
-            users_embed_next = tf.reduce_sum(fusion_embed_items, axis=1, keepdims=False)
+            # normalize the distribution of embeddings.
+            norm_embeddings = tf.nn.l2_normalize(ego_embeddings, axis=1)
 
-            ego_embed_next = tf.concat([users_embed_next, items_embed_next], axis=0)
+            all_embeddings += [norm_embeddings]
 
-            ego_embed = ego_embed_next
-
-            all_embed += [ego_embed]
-
-        all_embed = tf.stack(all_embed, 1)
-        all_embed = tf.reduce_mean(all_embed, axis=1, keepdims=False)
-        u_g_embeddings, i_g_embeddings = tf.split(all_embed, [self.n_users, self.n_items], 0)
-
+        all_embeddings = tf.concat(all_embeddings, 1)
+        u_g_embeddings, i_g_embeddings = tf.split(all_embeddings, [self.n_users, self.n_items], 0)
         return u_g_embeddings, i_g_embeddings
 
     def create_bpr_loss(self, users, pos_items, neg_items):
@@ -304,6 +310,7 @@ class CombiGCN(object):
         pre_out = tf.sparse_retain(X, dropout_mask)
 
         return pre_out * tf.div(1., keep_prob)
+
 
 def load_pretrained_data():
     pretrain_path = '%spretrain/%s/%s.npz' % (args.proj_path, args.dataset, 'embedding')
@@ -380,15 +387,10 @@ if __name__ == '__main__':
     *********************************************************
     Generate the Laplacian matrix, where each entry defines the decay factor (e.g., p_ui) between two connected nodes.
     """
-    interaction_adj, social_adj, similar_users_adj, sharing_adj, location_adj, similar_item_adj, similar_item_time_adj, spatio_temporal_adj = data_generator.get_norm_adj_mat()
+    interaction_adj, social_adj, similar_users_adj, _, _ = data_generator.get_norm_adj_mat()
     config['norm_adj'] = interaction_adj
     config['social_adj'] = social_adj
     config['similar_users_adj'] = similar_users_adj
-    config['spatio_temporal_adj'] = spatio_temporal_adj
-    config['sharing_adj'] = sharing_adj
-    config['location_adj'] = location_adj
-    config['similar_item_adj'] = similar_item_adj
-    config['similar_item_time_adj'] = similar_item_time_adj
 
     t0 = time()
     if args.pretrain == -1:
@@ -511,19 +513,17 @@ if __name__ == '__main__':
 
         if (epoch % 10) != 0:
             if args.verbose > 0 and epoch % args.verbose == 0:
-                perf_str = '%d-[%.1fs]-[%.5f=%.5f+%.5f]' % (
+                perf_str = 'Epoch %d [%.1fs]: train==[%.5f=%.5f + %.5f]' % (
                     epoch, time() - t1, loss, mf_loss, emb_loss)
                 print(perf_str)
             continue
         users_to_test = list(data_generator.train_items.keys())
         ret = test(sess, model, users_to_test, drop_flag=True, train_set_flag=1)
-        perf_str = '%d-[%.5f=%.5f+%.5f+%.5f]-[%s]-[%s]-[%s]-[%s]-[%s]' % \
+        perf_str = 'Epoch %d: train==[%.5f=%.5f + %.5f + %.5f], recall=[%s], precision=[%s], ndcg=[%s]' % \
                    (epoch, loss, mf_loss, emb_loss, reg_loss,
                     ', '.join(['%.5f' % r for r in ret['recall']]),
                     ', '.join(['%.5f' % r for r in ret['precision']]),
-                    ', '.join(['%.5f' % r for r in ret['ndcg']]),
-                    ', '.join(['%.5f' % r for r in ret['map']]),
-                    ', '.join(['%.5f' % r for r in ret['mrr']]))
+                    ', '.join(['%.5f' % r for r in ret['ndcg']]))
         print(perf_str)
         summary_train_acc = sess.run(model.merged_train_acc, feed_dict={model.train_rec_first: ret['recall'][0],
                                                                         model.train_rec_last: ret['recall'][-1],
@@ -578,13 +578,12 @@ if __name__ == '__main__':
         ndcg_loger.append(ret['ndcg'])
 
         if args.verbose > 0:
-            perf_str = '@%d-[%.1fs+%.1fs]-[%.5f=%.5f+%.5f+%.5f]-[%s]-[%s]-[%s]-[%s]-[%s]' % \
+            perf_str = 'Epoch %d [%.1fs + %.1fs]: test==[%.5f=%.5f + %.5f + %.5f], recall=[%s], ' \
+                       'precision=[%s], ndcg=[%s]' % \
                        (epoch, t2 - t1, t3 - t2, loss_test, mf_loss_test, emb_loss_test, reg_loss_test,
                         ', '.join(['%.5f' % r for r in ret['recall']]),
                         ', '.join(['%.5f' % r for r in ret['precision']]),
-                        ', '.join(['%.5f' % r for r in ret['ndcg']]),
-                        ', '.join(['%.5f' % r for r in ret['map']]),
-                        ', '.join(['%.5f' % r for r in ret['mrr']]))
+                        ', '.join(['%.5f' % r for r in ret['ndcg']]))
             print(perf_str)
 
         cur_best_pre_0, stopping_step, should_stop = early_stopping(ret['recall'][0], cur_best_pre_0,

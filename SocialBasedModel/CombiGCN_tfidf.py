@@ -13,24 +13,21 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 cpus = [x.name for x in device_lib.list_local_devices() if x.device_type == 'CPU']
 
 
-class LightGCN(object):
+class CombiGCN(object):
     def __init__(self, data_config, pretrain_data):
         # argument settings
-        self.model_type = 'lightgcn_location'
+        self.model_type = args.model_type
         self.adj_type = args.adj_type
-        self.alg_type = 'lightgcn_location'
+        self.alg_type = args.alg_type
         self.pretrain_data = pretrain_data
         self.n_users = data_config['n_users']
         self.n_items = data_config['n_items']
-        self.n_fold = 100
+        self.n_fold = 1
+        self.n_fold_items = 1
         self.norm_adj = data_config['norm_adj']
         self.social_adj = data_config['social_adj']
         self.similar_users_adj = data_config['similar_users_adj']
-        self.sharing_adj = data_config['sharing_adj']
-        self.location_adj = data_config['location_adj']
-        self.similar_item_adj = data_config['similar_item_adj']
-        self.similar_item_time_adj = data_config['similar_item_time_adj']
-        self.spatio_temporal_adj = data_config['spatio_temporal_adj']
+        self.similar_items_adj = data_config['similar_items_adj']
         self.n_nonzero_elems = self.norm_adj.count_nonzero()
         self.lr = args.lr
         self.emb_dim = args.embed_size
@@ -116,7 +113,7 @@ class LightGCN(object):
             2. combigcn: Our model-s in "Combining social relations and interaction data in Recommender System with Graph Convolution Collaborative Filtering";
         """
 
-        self.ua_embeddings, self.ia_embeddings = self._create_lightgcn_embed()
+        self.ua_embeddings, self.ia_embeddings = self._create_combigcn_embed()
 
         """
         *********************************************************
@@ -201,8 +198,8 @@ class LightGCN(object):
 
         return A_fold_hat
 
-    def _split_U_hat(self, X):
-        SI_fold_hat = []
+    def _split_SU_hat(self, X):
+        SU_fold_hat = []
         fold_len = self.n_users // self.n_fold
         for i_fold in range(self.n_fold):
             start = i_fold * fold_len
@@ -211,15 +208,15 @@ class LightGCN(object):
             else:
                 end = (i_fold + 1) * fold_len
             H = X[start:end]
-            SI_fold_hat.append(self._convert_sp_mat_to_sp_tensor(H))
-        return SI_fold_hat
+            SU_fold_hat.append(self._convert_sp_mat_to_sp_tensor(H))
+        return SU_fold_hat
 
-    def _split_I_hat(self, X):
+    def _split_SI_hat(self, X):
         SI_fold_hat = []
-        fold_len = self.n_items // self.n_fold
-        for i_fold in range(self.n_fold):
+        fold_len = self.n_items // self.n_fold_items
+        for i_fold in range(self.n_fold_items):
             start = i_fold * fold_len
-            if i_fold == self.n_fold - 1:
+            if i_fold == self.n_fold_items - 1:
                 end = self.n_items
             else:
                 end = (i_fold + 1) * fold_len
@@ -227,14 +224,14 @@ class LightGCN(object):
             SI_fold_hat.append(self._convert_sp_mat_to_sp_tensor(H))
         return SI_fold_hat
 
-    def _create_lightgcn_embed(self):
+    def _create_combigcn_embed(self):
         if self.node_dropout_flag:
             A_fold_hat = self._split_A_hat_node_dropout(self.norm_adj)
         else:
             A_fold_hat = self._split_A_hat(self.norm_adj)
 
-        SI_fold_hat = self._split_U_hat(self.similar_users_adj)
-        SL_fold_hat = self._split_I_hat(self.location_adj)
+        SU_fold_hat = self._split_SU_hat(self.similar_users_adj)
+        SI_fold_hat = self._split_SI_hat(self.similar_items_adj)
 
         users_embed = self.weights['user_embedding']
         items_embed = self.weights['item_embedding']
@@ -250,23 +247,25 @@ class LightGCN(object):
                 temp_embed_interaction.append(tf.sparse_tensor_dense_matmul(A_fold_hat[fold], ego_embed))
             all_embed_interaction = tf.concat(temp_embed_interaction, axis=0)
 
-            temp_embed_location = []
-            for fold in range(self.n_fold):
-                temp_embed_location.append(tf.sparse_tensor_dense_matmul(SL_fold_hat[fold], items_embed))
-            items_embed_distance = tf.concat(temp_embed_location, axis=0)
-
             temp_embed_similar_users = []
             for fold in range(self.n_fold):
-                temp_embed_similar_users.append(tf.sparse_tensor_dense_matmul(SI_fold_hat[fold], users_embed))
+                temp_embed_similar_users.append(tf.sparse_tensor_dense_matmul(SU_fold_hat[fold], users_embed))
             users_embed_similar = tf.concat(temp_embed_similar_users, axis=0)
 
-            user_embed_interaction, items_embed_interaction = tf.split(all_embed_interaction,
-                                                                       [self.n_users, self.n_items],
-                                                                       0)
+            temp_embed_similar_items = []
+            for fold in range(self.n_fold_items):
+                temp_embed_similar_items.append(tf.sparse_tensor_dense_matmul(SI_fold_hat[fold], items_embed))
+            items_embed_similar = tf.concat(temp_embed_similar_items, axis=0)
 
-            users_embed_next = tf.nn.leaky_relu(user_embed_interaction + users_embed_similar)
+            users_embed_interaction, items_embed_interaction = tf.split(all_embed_interaction, [self.n_users, self.n_items],
+                                                                 0)
+            fusion_embed_users = [users_embed_interaction, users_embed_similar]
+            fusion_embed_users = tf.stack(fusion_embed_users, 1)
+            users_embed_next = tf.reduce_sum(fusion_embed_users, axis=1, keepdims=False)
 
-            items_embed_next = tf.nn.leaky_relu(items_embed_interaction+ items_embed_distance)
+            fusion_embed_items = [items_embed_interaction, items_embed_similar]
+            fusion_embed_items = tf.stack(fusion_embed_items, 1)
+            items_embed_next = tf.reduce_sum(fusion_embed_items, axis=1, keepdims=False)
 
             ego_embed_next = tf.concat([users_embed_next, items_embed_next], axis=0)
 
@@ -389,22 +388,18 @@ if __name__ == '__main__':
     *********************************************************
     Generate the Laplacian matrix, where each entry defines the decay factor (e.g., p_ui) between two connected nodes.
     """
-    interaction_adj, social_adj, similar_users_adj, sharing_adj, location_adj, similar_item_adj, similar_item_time_adj, spatio_temporal_adj = data_generator.get_norm_adj_mat()
+    interaction_adj, social_adj, similar_users_adj, similar_items_adj, _ = data_generator.get_norm_adj_mat()
     config['norm_adj'] = interaction_adj
     config['social_adj'] = social_adj
     config['similar_users_adj'] = similar_users_adj
-    config['spatio_temporal_adj'] = spatio_temporal_adj
-    config['sharing_adj'] = sharing_adj
-    config['location_adj'] = location_adj
-    config['similar_item_adj'] = similar_item_adj
-    config['similar_item_time_adj'] = similar_item_time_adj
+    config['similar_items_adj'] = similar_items_adj
 
     t0 = time()
     if args.pretrain == -1:
         pretrain_data = load_pretrained_data()
     else:
         pretrain_data = None
-    model = LightGCN(data_config=config, pretrain_data=pretrain_data)
+    model = CombiGCN(data_config=config, pretrain_data=pretrain_data)
 
     """
     *********************************************************
@@ -520,19 +515,17 @@ if __name__ == '__main__':
 
         if (epoch % 10) != 0:
             if args.verbose > 0 and epoch % args.verbose == 0:
-                perf_str = '%d-[%.1fs]-[%.5f=%.5f+%.5f]' % (
+                perf_str = 'Epoch %d [%.1fs]: train==[%.5f=%.5f + %.5f]' % (
                     epoch, time() - t1, loss, mf_loss, emb_loss)
                 print(perf_str)
             continue
         users_to_test = list(data_generator.train_items.keys())
         ret = test(sess, model, users_to_test, drop_flag=True, train_set_flag=1)
-        perf_str = '%d-[%.5f=%.5f+%.5f+%.5f]-[%s]-[%s]-[%s]-[%s]-[%s]' % \
+        perf_str = 'Epoch %d: train==[%.5f=%.5f + %.5f + %.5f], recall=[%s], precision=[%s], ndcg=[%s]' % \
                    (epoch, loss, mf_loss, emb_loss, reg_loss,
                     ', '.join(['%.5f' % r for r in ret['recall']]),
                     ', '.join(['%.5f' % r for r in ret['precision']]),
-                    ', '.join(['%.5f' % r for r in ret['ndcg']]),
-                    ', '.join(['%.5f' % r for r in ret['map']]),
-                    ', '.join(['%.5f' % r for r in ret['mrr']]))
+                    ', '.join(['%.5f' % r for r in ret['ndcg']]))
         print(perf_str)
         summary_train_acc = sess.run(model.merged_train_acc, feed_dict={model.train_rec_first: ret['recall'][0],
                                                                         model.train_rec_last: ret['recall'][-1],
@@ -587,13 +580,12 @@ if __name__ == '__main__':
         ndcg_loger.append(ret['ndcg'])
 
         if args.verbose > 0:
-            perf_str = '@%d-[%.1fs+%.1fs]-[%.5f=%.5f+%.5f+%.5f]-[%s]-[%s]-[%s]-[%s]-[%s]' % \
+            perf_str = 'Epoch %d [%.1fs + %.1fs]: test==[%.5f=%.5f + %.5f + %.5f], recall=[%s], ' \
+                       'precision=[%s], ndcg=[%s]' % \
                        (epoch, t2 - t1, t3 - t2, loss_test, mf_loss_test, emb_loss_test, reg_loss_test,
                         ', '.join(['%.5f' % r for r in ret['recall']]),
                         ', '.join(['%.5f' % r for r in ret['precision']]),
-                        ', '.join(['%.5f' % r for r in ret['ndcg']]),
-                        ', '.join(['%.5f' % r for r in ret['map']]),
-                        ', '.join(['%.5f' % r for r in ret['mrr']]))
+                        ', '.join(['%.5f' % r for r in ret['ndcg']]))
             print(perf_str)
 
         cur_best_pre_0, stopping_step, should_stop = early_stopping(ret['recall'][0], cur_best_pre_0,
